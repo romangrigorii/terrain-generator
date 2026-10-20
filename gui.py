@@ -1,25 +1,31 @@
 """Asset studio for the terrain generator.
 
-Shows the land as each stage finishes, then the maps the game imports.
-Export writes library/terrain/zemia_height.png, material_mask.png and
-flow_mask.png, plus the generator's own bundle under out/export/.
+The view is a 640-wide preview. Export upscales that preview to the chosen
+resolution, up to 256K (262144 pixels wide). Widths through 8K are one image.
+Wider maps are tiles.
+
+Export writes the chosen size under library/terrain/hires/, a game-sized copy
+at library/terrain/ (2048 wide at most), and the generator bundle under out/export/.
 
     python gui.py
 """
+import math
 import queue
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
 import pygame
 from PIL import Image
 
+import hires
 from terrain import Config, climate, export, generate, grid, render
 
 ASSETS = Path(__file__).resolve().parents[2]
 LIBRARY_TERRAIN = ASSETS / "library" / "terrain"
+BUNDLE_PARENT = Path(__file__).resolve().parent / "out" / "export"
 
-SIZES = [(320, 224), (480, 336), (640, 448), (1024, 768)]
 HEIGHT_STAGES = {"relief", "hotspots", "texture", "coastline", "erosion", "rivers"}
 
 COVER = {
@@ -36,6 +42,35 @@ TEXT = (230, 232, 236)
 MUTED = (150, 156, 168)
 ACCENT = (120, 176, 214)
 WARN = (230, 186, 110)
+BAR_H = 36
+
+# Share of a typical simulation. A tiled export then counts each tile as 1,
+# so a 256K job (thousands of tiles) spends almost the whole bar on writing.
+STAGE_WEIGHTS = (
+    ("plates", 2),
+    ("relief", 6),
+    ("hotspots", 2),
+    ("texture", 6),
+    ("coastline", 5),
+    ("pre-rain", 4),
+    ("erosion", 28),
+    ("temperature", 3),
+    ("climate", 5),
+    ("rivers", 12),
+    ("biomes", 4),
+    ("trees", 2),
+)
+
+
+def format_duration(seconds):
+    seconds = max(0, int(round(seconds)))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {seconds:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m"
 
 
 def _rgb(image):
@@ -59,6 +94,7 @@ def _preview_height(stage, value):
     height = value[0] if isinstance(value, tuple) else value
     if not isinstance(height, np.ndarray) or height.ndim != 2:
         return None
+    height = hires.downsample(height, hires.PREVIEW_WIDTH)
     return render.relief(height).astype(np.uint8)
 
 
@@ -129,16 +165,33 @@ def assets_of(world):
     }
 
 
-def export_assets(world, library_dir):
+def _save_rgb(image, path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(_rgb(image), "RGB").save(path)
+
+
+def write_game_copy(made, library_dir):
+    """8-bit maps the game can load as one mesh. Never wider than GAME_MAX."""
     library_dir.mkdir(parents=True, exist_ok=True)
-    made = assets_of(world)
-    Image.fromarray(made["height"], "RGB").save(library_dir / "zemia_height.png")
-    Image.fromarray(made["_mask"], "RGBA").save(library_dir / "material_mask.png")
-    Image.fromarray(made["flow"], "RGB").save(library_dir / "flow_mask.png")
-    Image.fromarray(_rgb(made["world"]), "RGB").save(library_dir / "preview.png")
-    folder = export.bundle(world, parent=Path(__file__).resolve().parent / "out" / "export")
-    Image.fromarray(_rgb(made["world"]), "RGB").save(folder / "main_view.png")
-    return library_dir, folder
+    _save_rgb(hires.downsample(made["height"], hires.GAME_MAX), library_dir / "zemia_height.png")
+    mask = hires.downsample(made["_mask"], hires.GAME_MAX)
+    Image.fromarray(np.ascontiguousarray(mask), "RGBA").save(library_dir / "material_mask.png")
+    _save_rgb(hires.downsample(made["flow"], hires.GAME_MAX), library_dir / "flow_mask.png")
+    _save_rgb(hires.downsample(made["world"], hires.PREVIEW_WIDTH), library_dir / "preview.png")
+    return library_dir
+
+
+def _same_settings(world, settings):
+    cfg = world.cfg
+    return (cfg.seed == settings["seed"]
+            and cfg.n_plates == settings["n_plates"]
+            and abs(float(cfg.land_fraction) - settings["land_fraction"]) < 1e-6
+            and abs(float(cfg.temp_offset) - settings["temp_offset"]) < 1e-6)
+
+
+def preview_thumbs(made):
+    names = ("world", "height", "biomes", "material mask", "flow", "canopy")
+    return {name: hires.downsample(made[name], hires.PREVIEW_WIDTH) for name in names}
 
 
 class Slider:
@@ -179,6 +232,109 @@ class Button:
         screen.blit(img, img.get_rect(center=self.rect.center))
 
 
+class Progress:
+    """Weighted steps for a job, plus a time estimate from the steps already finished."""
+
+    def __init__(self):
+        self.active = False
+        self.title = ""
+        self.steps = []
+        self.index = -1
+        self.done_weight = 0.0
+        self.total_weight = 1.0
+        self.started = 0.0
+        self.step_started = 0.0
+        self.finished_at = None
+        self.label = ""
+        self.tile_frac = None
+
+    def begin(self, title, steps):
+        self.active = True
+        self.title = title
+        self.steps = [(name, float(weight)) for name, weight in steps]
+        self.index = -1
+        self.done_weight = 0.0
+        self.total_weight = max(1e-6, sum(weight for _, weight in self.steps))
+        now = time.perf_counter()
+        self.started = now
+        self.step_started = now
+        self.finished_at = None
+        self.label = "starting"
+        self.tile_frac = None
+
+    def advance(self, name):
+        """`name` is starting, so the step before it has finished."""
+        now = time.perf_counter()
+        if self.index >= 0:
+            self.done_weight += self.steps[self.index][1]
+        found = next((i for i, (step, _) in enumerate(self.steps)
+                      if step == name and i > self.index), None)
+        if found is None:
+            self.steps.append((name, 3.0))
+            self.total_weight += 3.0
+            found = len(self.steps) - 1
+        while self.index + 1 < found:
+            self.index += 1
+            self.done_weight += self.steps[self.index][1]
+        self.index = found
+        self.step_started = now
+        self.label = name
+        self.tile_frac = None
+
+    def tiles(self, done, total):
+        if self.index < 0 or self.steps[self.index][0] != "tiles":
+            self.advance("tiles")
+        total = max(1, total)
+        self.tile_frac = min(1.0, done / total)
+        self.label = f"tiles {done}/{total}"
+        if done >= total:
+            self.done_weight += self.steps[self.index][1]
+            self.steps[self.index] = ("tiles", 0.0)
+            self.tile_frac = 1.0
+
+    def complete(self):
+        if self.index >= 0 and self.index < len(self.steps):
+            self.done_weight += self.steps[self.index][1]
+            self.steps[self.index] = (self.steps[self.index][0], 0.0)
+        self.done_weight = self.total_weight
+        self.active = False
+        self.finished_at = time.perf_counter()
+        self.label = "done"
+        self.tile_frac = 1.0
+
+    def stop(self):
+        self.active = False
+        self.finished_at = None
+        self.label = ""
+
+    def snapshot(self):
+        """Fill fraction, elapsed seconds, seconds remaining, and the step name."""
+        now = time.perf_counter()
+        if not self.started:
+            return 0.0, 0.0, None, ""
+        elapsed = (self.finished_at or now) - self.started
+        if not self.active:
+            if self.finished_at:
+                return 1.0, elapsed, 0.0, "done"
+            return 0.0, 0.0, None, ""
+        current = self.steps[self.index][1] if 0 <= self.index < len(self.steps) else 0.0
+        if self.tile_frac is not None:
+            creep = self.tile_frac
+        else:
+            time_in = now - self.step_started
+            if self.done_weight > 0:
+                expected = current * elapsed / self.done_weight
+                creep = min(0.92, time_in / max(expected, 1e-3))
+            else:
+                creep = min(0.35, time_in / 8.0)
+        credited = self.done_weight + current * creep
+        fraction = min(0.995, credited / self.total_weight)
+        eta = None
+        if self.done_weight > 0 and elapsed > 0.3:
+            eta = elapsed * max(0.0, self.total_weight - credited) / credited
+        return fraction, elapsed, eta, self.label
+
+
 class Studio:
     def __init__(self):
         pygame.init()
@@ -189,12 +345,13 @@ class Studio:
         self.big = pygame.font.SysFont("segoeui,calibri,consolas", 20, bold=True)
         self.seed = 7
         self.seed_text = "7"
-        self.size_i = 1
+        self.res_i = 2
+        self.job = None
         self.plates = Slider("plates", 4, 48, 18)
         self.land = Slider("land", 15, 60, 29, fmt=lambda v: f"{v}%")
         self.temp = Slider("temperature", -20, 20, 0, fmt=lambda v: f"{v:+d} C")
-        self.generate_btn = Button("Generate", 200)
-        self.export_btn = Button("Export to game", 200)
+        self.generate_btn = Button("Generate preview", 252)
+        self.export_btn = Button("Export maps", 252)
         self.export_btn.enabled = False
         self.size_rects = []
         self.thumb_rects = []
@@ -206,22 +363,25 @@ class Studio:
         self.image_name = ""
         self.thumbs = {}
         self.world = None
+        self.made = None
         self.busy = False
-        self.status = "Generate a world. The map updates as each stage finishes."
+        self.status = "Generate a preview. The view stays downscaled. Export upscales that preview, up to 256K."
         self.seed_box = pygame.Rect(16, 72, 252, 28)
         self.events = queue.Queue()
         self.clock = pygame.time.Clock()
+        self.progress = Progress()
 
-    def config(self):
-        width, height = SIZES[self.size_i]
-        return Config(
-            width=width,
-            height=height,
+    def settings(self):
+        return dict(
             seed=self.seed,
             n_plates=self.plates.value,
             land_fraction=self.land.value / 100,
             temp_offset=float(self.temp.value),
         )
+
+    def config(self):
+        width, height = hires.map_size(hires.PREVIEW_WIDTH)
+        return Config(width=width, height=height, **self.settings())
 
     def start(self):
         if self.busy:
@@ -232,16 +392,18 @@ class Studio:
             self.status = "Seed needs to be a whole number."
             return
         self.busy = True
+        self.job = "preview"
         self.export_btn.enabled = False
         self.thumbs = {}
         self.world = None
-        self.status = "starting"
+        self.status = "starting preview"
+        self.progress.begin("Generating preview", STAGE_WEIGHTS + (("maps", 4),))
         cfg = self.config()
         threading.Thread(target=self._worker, args=(cfg,), daemon=True).start()
 
     def _worker(self, cfg):
         def on_stage(name):
-            self.events.put(("status", f"{name}..."))
+            self.events.put(("stage", name))
 
         def on_preview(name, value):
             image = _preview_height(name, value)
@@ -250,10 +412,11 @@ class Studio:
 
         try:
             world = generate(cfg, verbose=False, on_stage=on_stage, on_preview=on_preview)
+            self.events.put(("stage", "maps"))
+            made = assets_of(world)
         except Exception as err:
-            self.events.put(("error", str(err)))
+            self.events.put(("error", f"generation failed: {err}"))
             return
-        made = assets_of(world)
         self.events.put(("done", world, made))
 
     def pump(self):
@@ -263,27 +426,56 @@ class Studio:
                 kind = event[0]
                 if kind == "status":
                     self.status = event[1]
+                elif kind == "stage":
+                    self.progress.advance(event[1])
+                    self.status = event[1]
+                elif kind == "tiles":
+                    done, total = event[1], event[2]
+                    self.progress.tiles(done, total)
+                    if done == total or done % 8 == 0:
+                        self.status = f"writing tiles {done}/{total}"
                 elif kind == "image":
                     self._set_image(event[1], event[2], fit=self.image is None)
-                elif kind == "done":
+                elif kind == "preview_ready":
                     self.world, made = event[1], event[2]
+                    self.made = made
                     self.thumbs = {name: made[name] for name in
                                    ("world", "height", "biomes", "material mask", "flow", "canopy")}
                     self._set_image("world", made["world"], fit=True)
+                elif kind == "done":
+                    self.world, made = event[1], event[2]
+                    self.made = made
+                    self.thumbs = {name: made[name] for name in
+                                   ("world", "height", "biomes", "material mask", "flow", "canopy")}
+                    self._set_image("world", made["world"], fit=True)
+                    self.progress.complete()
                     self.busy = False
+                    self.job = None
                     self.export_btn.enabled = True
                     h, w = self.world.height.shape
-                    self.status = (f"seed {self.world.cfg.seed}  {w}x{h}  "
-                                   f"land {self.world.land.mean():.0%}  ready to export")
-                elif kind == "error":
+                    chosen = hires.EXPORT_WIDTHS[self.res_i]
+                    self.status = (f"preview {w}×{h}, land {self.world.land.mean():.0%}. "
+                                   f"Export writes {hires.describe(chosen)}")
+                elif kind == "exported":
+                    self.progress.complete()
                     self.busy = False
-                    self.status = f"generation failed: {event[1]}"
+                    self.job = None
+                    self.export_btn.enabled = self.world is not None
+                    self.status = event[1]
+                    self.thumbs = event[2]
+                    self._set_image("world", self.thumbs["world"], fit=True)
+                elif kind == "error":
+                    self.progress.stop()
+                    self.busy = False
+                    self.job = None
+                    self.export_btn.enabled = self.world is not None
+                    self.status = event[1]
         except queue.Empty:
             pass
 
     def _set_image(self, name, image, fit=False):
         self.image_name = name
-        self.image = _surface(image)
+        self.image = _surface(hires.downsample(image, hires.PREVIEW_WIDTH))
         if fit:
             self.fit()
 
@@ -297,8 +489,73 @@ class Studio:
     def export(self):
         if self.world is None or self.busy:
             return
-        library, folder = export_assets(self.world, LIBRARY_TERRAIN)
-        self.status = f"exported {library.relative_to(ASSETS).as_posix()} and {folder.as_posix()}"
+        try:
+            self.seed = int(self.seed_text)
+        except ValueError:
+            self.status = "Seed needs to be a whole number."
+            return
+        self.busy = True
+        self.job = "export"
+        self.export_btn.enabled = False
+        width = hires.EXPORT_WIDTHS[self.res_i]
+        settings = self.settings()
+        resim = not _same_settings(self.world, settings)
+        w, h = hires.map_size(width)
+        steps = list(STAGE_WEIGHTS) + [("maps", 4)] if resim else []
+        if width > hires.DIRECT_MAX:
+            ntiles = math.ceil(w / hires.TILE) * math.ceil(h / hires.TILE)
+            steps.append(("tiles", ntiles))
+        else:
+            steps.append(("writing", 8))
+        self.progress.begin(f"Exporting {hires.EXPORT_LABELS[self.res_i]}", steps)
+        threading.Thread(
+            target=self._export_worker, args=(width, settings, resim), daemon=True).start()
+
+    def _simulate(self, width, height, settings):
+        cfg = Config(width=width, height=height, **settings)
+
+        def on_stage(name):
+            self.events.put(("stage", f"{name}"))
+
+        def on_preview(name, value):
+            image = _preview_height(name, value)
+            if image is not None:
+                self.events.put(("image", name, image))
+
+        return generate(cfg, verbose=False, on_stage=on_stage, on_preview=on_preview)
+
+    def _export_worker(self, width, settings, resim):
+        w, h = hires.map_size(width)
+        try:
+            if resim:
+                pw, ph = hires.map_size(hires.PREVIEW_WIDTH)
+                self.events.put(("status", f"rebuilding preview at {pw}×{ph}"))
+                world = self._simulate(pw, ph, settings)
+                self.events.put(("stage", "maps"))
+                made = assets_of(world)
+                self.events.put(("preview_ready", world, made))
+            else:
+                world, made = self.world, self.made
+            folder = LIBRARY_TERRAIN / "hires" / f"seed{settings['seed']}_{w}x{h}"
+            self.events.put(("status", f"upscaling preview to {w}×{h}"))
+            if width > hires.DIRECT_MAX:
+                hires.write_tiles(
+                    world.height, made["_mask"], made["flow"], w, h, settings["seed"], folder,
+                    on_tile=lambda done, total: self.events.put(("tiles", done, total)),
+                )
+            else:
+                self.events.put(("stage", "writing"))
+                hires.write_direct(
+                    world.height, made["_mask"], made["flow"], w, h, settings["seed"], folder)
+            game = write_game_copy(made, LIBRARY_TERRAIN)
+            bundle = export.bundle(world, parent=BUNDLE_PARENT)
+            Image.fromarray(_rgb(hires.downsample(made["world"], hires.PREVIEW_WIDTH)), "RGB").save(
+                bundle / "main_view.png")
+            note = (f"exported {w}×{h} to {folder.as_posix()}. "
+                    f"Game copy is in {game.as_posix()}. Bundle is {bundle.as_posix()}")
+            self.events.put(("exported", note, preview_thumbs(made)))
+        except Exception as err:
+            self.events.put(("error", f"export failed: {err}"))
 
     def draw_map(self):
         pygame.draw.rect(self.screen, (10, 12, 16), self.view)
@@ -317,6 +574,8 @@ class Studio:
         self.screen.set_clip(None)
         label = self.big.render(self.image_name or "preview", True, (255, 226, 150))
         self.screen.blit(label, (self.view.x + 12, self.view.y + 10))
+        note = self.small.render("downscaled preview", True, (255, 226, 150))
+        self.screen.blit(note, (self.view.x + 12, self.view.y + 34))
 
     def draw_panel(self):
         panel = pygame.Rect(0, 0, 284, self.screen.get_height())
@@ -332,19 +591,22 @@ class Studio:
         self.screen.blit(self.font.render(self.seed_text or " ", True, TEXT), (24, y + 22))
         self.seed_box = box
         y += 62
-        self.screen.blit(self.small.render("map size", True, MUTED), (16, y))
-        y += 20
+        self.screen.blit(self.small.render("export resolution", True, MUTED), (16, y))
+        y += 18
         self.size_rects = []
-        x = 16
-        for i, (w, h) in enumerate(SIZES):
-            rect = pygame.Rect(x, y, 60, 26)
-            on = i == self.size_i
+        bw, bh, gap, cols = 46, 24, 4, 5
+        for i, label in enumerate(hires.EXPORT_LABELS):
+            row, col = divmod(i, cols)
+            rect = pygame.Rect(16 + col * (bw + gap), y + row * (bh + gap), bw, bh)
+            on = i == self.res_i
             pygame.draw.rect(self.screen, (46, 78, 108) if on else (36, 40, 48), rect, border_radius=3)
-            img = self.small.render(f"{w}", True, TEXT)
+            img = self.small.render(label, True, TEXT)
             self.screen.blit(img, img.get_rect(center=rect.center))
             self.size_rects.append(rect)
-            x += 64
-        y += 44
+        y += 2 * (bh + gap) + 8
+        chosen = hires.EXPORT_WIDTHS[self.res_i]
+        y = self._wrapped(hires.describe(chosen), 16, y, 252, WARN if chosen >= 131072 else MUTED)
+        y += 10
         for slider in (self.plates, self.land, self.temp):
             slider.rect.topleft = (16, y + 18)
             slider.rect.w = 248
@@ -353,31 +615,34 @@ class Studio:
         y += 8
         self.generate_btn.rect.topleft = (16, y)
         self.generate_btn.enabled = not self.busy
-        self.generate_btn.label = "Generating..." if self.busy else "Generate"
+        self.generate_btn.label = "Generating..." if self.busy and self.job == "preview" else "Generate preview"
         self.generate_btn.draw(self.screen, self.font)
         y += 38
         self.export_btn.rect.topleft = (16, y)
+        self.export_btn.label = "Exporting..." if self.busy and self.job == "export" else "Export maps"
         self.export_btn.draw(self.screen, self.font)
         y += 46
         self._wrapped(self.status, 16, y, 252)
 
-    def _wrapped(self, text, x, y, width):
+    def _wrapped(self, text, x, y, width, color=MUTED):
         words, line = text.split(), ""
         for word in words:
             trial = f"{line} {word}".strip()
             if self.small.size(trial)[0] > width and line:
-                self.screen.blit(self.small.render(line, True, MUTED), (x, y))
+                self.screen.blit(self.small.render(line, True, color), (x, y))
                 y += 18
                 line = word
             else:
                 line = trial
         if line:
-            self.screen.blit(self.small.render(line, True, MUTED), (x, y))
+            self.screen.blit(self.small.render(line, True, color), (x, y))
+            y += 18
+        return y
 
     def draw_thumbs(self):
         names = ["world", "height", "biomes", "material mask", "flow", "canopy"]
         self.thumb_rects = []
-        y = self.screen.get_height() - 128
+        y = self.screen.get_height() - 128 - BAR_H
         x = 300
         for name in names:
             rect = pygame.Rect(x, y, 150, 112)
@@ -392,12 +657,44 @@ class Studio:
             self.thumb_rects.append((rect, name))
             x += 162
 
+    def draw_bar(self):
+        width, height = self.screen.get_size()
+        rect = pygame.Rect(0, height - BAR_H, width, BAR_H)
+        pygame.draw.rect(self.screen, (12, 14, 18), rect)
+        pygame.draw.line(self.screen, LINE, (0, rect.y), (width, rect.y))
+        fraction, elapsed, eta, label = self.progress.snapshot()
+        recent = self.progress.finished_at and (time.perf_counter() - self.progress.finished_at < 10)
+        track = pygame.Rect(12, rect.y + 16, width - 24, 12)
+        pygame.draw.rect(self.screen, (36, 40, 48), track, border_radius=4)
+        if self.progress.active or recent:
+            fill = track.copy()
+            fill.w = max(0, int(track.w * fraction))
+            if fill.w:
+                pygame.draw.rect(self.screen, ACCENT, fill, border_radius=4)
+            if self.progress.active:
+                title = f"{self.progress.title}   {label}   {fraction * 100:.0f}%"
+                if eta is None:
+                    right = f"{format_duration(elapsed)} elapsed   estimating"
+                else:
+                    right = f"{format_duration(elapsed)} elapsed   {format_duration(eta)} left"
+            else:
+                title = f"{self.progress.title}   finished in {format_duration(elapsed)}"
+                right = ""
+        else:
+            title, right = "Ready", ""
+        self.screen.blit(self.small.render(title, True, TEXT), (12, rect.y + 1))
+        if right:
+            img = self.small.render(right, True, MUTED)
+            self.screen.blit(img, (width - 12 - img.get_width(), rect.y + 1))
+
     def draw(self):
         self.screen.fill(BG)
-        self.view = pygame.Rect(300, 12, self.screen.get_width() - 316, self.screen.get_height() - 156)
+        self.view = pygame.Rect(300, 12, self.screen.get_width() - 316,
+                                self.screen.get_height() - 156 - BAR_H)
         self.draw_map()
         self.draw_thumbs()
         self.draw_panel()
+        self.draw_bar()
         pygame.display.flip()
 
     def on_click(self, pos):
@@ -412,7 +709,7 @@ class Studio:
             return
         for i, rect in enumerate(self.size_rects):
             if rect.collidepoint(pos) and not self.busy:
-                self.size_i = i
+                self.res_i = i
                 return
         if self.generate_btn.rect.collidepoint(pos):
             self.start()

@@ -47,7 +47,7 @@ def _chunk(tag, data):
             struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
 
 
-def _write_png(path, a, depth):
+def _write_png(path, a, depth, level=6):
     """Greyscale, 8- or 16-bit, filter type 0 on every row - all the format needs."""
     h, w = a.shape
     # PNG samples are big-endian regardless of the machine writing them.
@@ -58,7 +58,7 @@ def _write_png(path, a, depth):
     with open(path, "wb") as f:
         f.write(b"\x89PNG\r\n\x1a\n")
         f.write(_chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, depth, 0, 0, 0, 0)))
-        f.write(_chunk(b"IDAT", zlib.compress(raw.tobytes(), 6)))
+        f.write(_chunk(b"IDAT", zlib.compress(raw.tobytes(), level)))
         f.write(_chunk(b"IEND", b""))
 
 
