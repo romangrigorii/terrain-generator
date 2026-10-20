@@ -392,9 +392,13 @@ class World:
         }
 
 
-def generate(cfg=None, verbose=True, on_stage=None, **overrides):
+def generate(cfg=None, verbose=True, on_stage=None, on_preview=None, **overrides):
     """`on_stage(name)` is called before each stage; a big map takes a minute
-    and a caller with a window needs something to put on it."""
+    and a caller with a window needs something to put on it.
+
+    `on_preview(name, value)` is called after each stage with that stage's
+    return value, so a window can draw the land as it appears. It must not
+    change `value`."""
     cfg = cfg or Config()
     for k, v in overrides.items():
         setattr(cfg, k, v)
@@ -412,6 +416,8 @@ def generate(cfg=None, verbose=True, on_stage=None, **overrides):
         timings[name] = time.perf_counter() - t0
         if verbose:
             print(f"  {name:<12} {timings[name]:6.2f}s")
+        if on_preview:
+            on_preview(name, out)
         return out
 
     if verbose:

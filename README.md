@@ -7,10 +7,10 @@ ocean at the poles.
 
 ## Install
 
-Python 3.11, then the three libraries it is made of:
+Python 3.11, then:
 
 ```bash
-pip install numpy scipy pygame
+pip install -r requirements.txt
 ```
 
 `tkinter`, for the import dialog, ships with Python on Windows.
@@ -19,6 +19,10 @@ pip install numpy scipy pygame
 
 ```bash
 python main.py
+```
+
+```bash
+python gui.py            # asset studio: live preview, export into library/terrain
 ```
 
 ```bash
